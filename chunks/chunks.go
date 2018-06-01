@@ -99,6 +99,7 @@ func NewWriter(dir string) (*Writer, error) {
 		return nil, err
 	}
 	dirFile, err := fileutil.OpenDir(dir)
+	fmt.Println("New Chunk :", dirFile.Name())
 	if err != nil {
 		return nil, err
 	}

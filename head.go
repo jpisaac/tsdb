@@ -14,6 +14,7 @@
 package tsdb
 
 import (
+	"fmt"
 	"math"
 	"runtime"
 	"sort"
@@ -179,6 +180,7 @@ func NewHead(r prometheus.Registerer, l log.Logger, wal WAL, chunkRange int64) (
 	if chunkRange < 1 {
 		return nil, errors.Errorf("invalid chunk range %d", chunkRange)
 	}
+	fmt.Println(fmt.Sprintf("valid chunk range %d", chunkRange))
 	h := &Head{
 		wal:        wal,
 		logger:     l,
@@ -319,6 +321,8 @@ func (h *Head) ReadWAL() error {
 	if unknownRefs > 0 {
 		level.Warn(h.logger).Log("msg", "unknown series references in WAL samples", "count", unknownRefs)
 	}
+	fmt.Println("Consumed WAL")
+
 	return nil
 }
 
@@ -448,6 +452,8 @@ func (h *Head) Appender() Appender {
 }
 
 func (h *Head) appender() *headAppender {
+	//level.Info(h.logger).Log("msg", "In appender", "max", h.MaxTime(), "range", h.chunkRange/2, "min:", (h.MaxTime() - h.chunkRange/2))
+
 	return &headAppender{
 		head:    h,
 		mint:    h.MaxTime() - h.chunkRange/2,
@@ -478,6 +484,7 @@ type headAppender struct {
 
 func (a *headAppender) Add(lset labels.Labels, t int64, v float64) (uint64, error) {
 	if t < a.mint {
+		level.Info(a.head.logger).Log("msg", "In Add", "ts:", t, "min:", a.mint)
 		return 0, ErrOutOfBounds
 	}
 
@@ -492,6 +499,7 @@ func (a *headAppender) Add(lset labels.Labels, t int64, v float64) (uint64, erro
 }
 
 func (a *headAppender) AddFast(ref uint64, t int64, v float64) error {
+	level.Info(a.head.logger).Log("msg - add fast", "min:", a.mint, "ts:", t)
 	s := a.head.series.getByID(ref)
 
 	if s == nil {

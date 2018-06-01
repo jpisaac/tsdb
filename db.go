@@ -27,6 +27,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"text/tabwriter"
 	"time"
 
 	"github.com/go-kit/kit/log"
@@ -252,6 +253,7 @@ func (db *DB) run() {
 	backoff := time.Duration(0)
 
 	for {
+		//level.Info(db.logger).Log("msg", "called after", "***************backoff******************", backoff)
 		select {
 		case <-db.stopc:
 			return
@@ -383,6 +385,8 @@ func (db *DB) compact() (changes bool, err error) {
 			mint: mint,
 			maxt: maxt,
 		}
+
+		level.Info(db.logger).Log("msg", "***************compacting******************")
 		if _, err = db.compactor.Write(db.dir, head, mint, maxt); err != nil {
 			return changes, errors.Wrap(err, "persist head block")
 		}
@@ -390,11 +394,13 @@ func (db *DB) compact() (changes bool, err error) {
 
 		runtime.GC()
 
+		//level.Info(db.logger).Log("msg", "called before", "***************reload******************", mint)
 		if err := db.reload(); err != nil {
 			return changes, errors.Wrap(err, "reload blocks")
 		}
 		runtime.GC()
 	}
+	//level.Info(db.logger).Log("msg", "called before", "***************plans******************", "done")
 
 	// Check for compactions of multiple blocks.
 	for {
@@ -412,6 +418,7 @@ func (db *DB) compact() (changes bool, err error) {
 		default:
 		}
 
+		level.Info(db.logger).Log("msg", "Compacting", "db-dir", db.dir, "plans", strings.Join(plan, ","))
 		if _, err := db.compactor.Compact(db.dir, plan...); err != nil {
 			return changes, errors.Wrapf(err, "compact %s", plan)
 		}
@@ -551,11 +558,54 @@ func (db *DB) reload(deleteable ...string) (err error) {
 		return nil
 	}
 	maxt := blocks[len(blocks)-1].Meta().MaxTime
+	/*
+	level.Info(db.logger).Log("msg", "**********************", "maxt", maxt)
+	printBlocks(oldBlocks)
+	printBlocks(db.blocks)
+	level.Info(db.logger).Log("msg", "**********************", "maxt", maxt)
+	*/
 
 	return errors.Wrap(db.head.Truncate(maxt), "head truncate failed")
 }
 
 // validateBlockSequence returns error if given block meta files indicate that some blocks overlaps within sequence.
+func printBlocks(blocks []*Block) {
+	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	defer tw.Flush()
+
+	fmt.Fprintln(tw, "BLOCK ULID\tMIN TIME\tMAX TIME\tNUM SAMPLES\tNUM CHUNKS\tNUM SERIES")
+	for _, b := range blocks {
+		meta := b.Meta()
+
+		fmt.Fprintf(tw,
+			"%v\t%v\t%v\t%v\t%v\t%v\n",
+			meta.ULID,
+			meta.MinTime,
+			meta.MaxTime,
+			meta.Stats.NumSamples,
+			meta.Stats.NumChunks,
+			meta.Stats.NumSeries,
+		)
+	}
+}
+
+func printMeta(meta *BlockMeta) {
+	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	defer tw.Flush()
+
+	fmt.Fprintln(tw, "BLOCK ULID\tMIN TIME\tMAX TIME\tNUM SAMPLES\tNUM CHUNKS\tNUM SERIES")
+	fmt.Fprintf(tw,
+		"%v\t%v\t%v\t%v\t%v\t%v\n",
+		meta.ULID,
+		meta.MinTime,
+		meta.MaxTime,
+		meta.Stats.NumSamples,
+		meta.Stats.NumChunks,
+		meta.Stats.NumSeries,
+	)
+
+}
+
 func validateBlockSequence(bs []*Block) error {
 	if len(bs) <= 1 {
 		return nil

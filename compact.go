@@ -320,6 +320,8 @@ func (c *LeveledCompactor) Compact(dest string, dirs ...string) (uid ulid.ULID, 
 		uids   []string
 	)
 
+	c.logger.Log("dirs: " + dest)
+
 	for _, d := range dirs {
 		b, err := OpenBlock(d, c.chunkPool)
 		if err != nil {
@@ -410,6 +412,13 @@ func (w *instrumentedChunkWriter) WriteChunks(chunks ...chunks.Meta) error {
 // write creates a new block that is the union of the provided blocks into dir.
 // It cleans up all files of the old blocks after completing successfully.
 func (c *LeveledCompactor) write(dest string, meta *BlockMeta, blocks ...BlockReader) (err error) {
+	/*
+	level.Info(c.logger).Log("msg", "compact blocks", "dest", dest, "count", len(blocks), "mint", meta.MinTime, "maxt", meta.MaxTime)
+	level.Info(c.logger).Log("msg", "**********OldMeta**************")
+	printMeta(meta)
+	level.Info(c.logger).Log("msg", "**********OldMeta*************")
+	*/
+
 	dir := filepath.Join(dest, meta.ULID.String())
 	tmp := dir + ".tmp"
 
@@ -459,6 +468,11 @@ func (c *LeveledCompactor) write(dest string, meta *BlockMeta, blocks ...BlockRe
 	if err := c.populateBlock(blocks, meta, indexw, chunkw); err != nil {
 		return errors.Wrap(err, "write compaction")
 	}
+	/*
+	level.Info(c.logger).Log("msg", "**********NewMeta**************")
+	printMeta(meta)
+	level.Info(c.logger).Log("msg", "**********NetaMeta*************")
+	*/
 
 	if err = writeMetaFile(tmp, meta); err != nil {
 		return errors.Wrap(err, "write merged meta")

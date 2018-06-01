@@ -596,6 +596,7 @@ func (w *SegmentWAL) cut() error {
 				if err := hf.Close(); err != nil {
 					return errors.Wrapf(err, "finish old segment %s", hf.Name())
 				}
+				level.Info(w.logger).Log("msg", "closeSegmentFile", "filename:", hf.Name())
 				return nil
 			}
 		}()
@@ -605,6 +606,8 @@ func (w *SegmentWAL) cut() error {
 	if err != nil {
 		return err
 	}
+	level.Info(w.logger).Log("msg", "createSegmentFile", "filename:", p)
+
 	f, err := w.createSegmentFile(p)
 	if err != nil {
 		return err

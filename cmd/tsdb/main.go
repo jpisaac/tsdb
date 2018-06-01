@@ -19,10 +19,13 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"net"
+	"net/http"
+	"net/http/pprof"
 	"os"
 	"path/filepath"
 	"runtime"
-	"runtime/pprof"
+	rprof "runtime/pprof"
 	"sort"
 	"strconv"
 	"strings"
@@ -32,6 +35,8 @@ import (
 
 	"github.com/go-kit/kit/log"
 	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/tsdb"
 	"github.com/prometheus/tsdb/labels"
 	"gopkg.in/alecthomas/kingpin.v2"
@@ -43,8 +48,8 @@ func main() {
 		benchCmd             = cli.Command("bench", "run benchmarks")
 		benchWriteCmd        = benchCmd.Command("write", "run a write performance benchmark")
 		benchWriteOutPath    = benchWriteCmd.Flag("out", "set the output path").Default("benchout/").String()
-		benchWriteNumMetrics = benchWriteCmd.Flag("metrics", "number of metrics to read").Default("10000").Int()
-		benchSamplesFile     = benchWriteCmd.Arg("file", "input file with samples data, default is (../../testdata/20kseries.json)").Default("../../testdata/20kseries.json").String()
+		benchWriteNumMetrics = benchWriteCmd.Flag("metrics", "number of metrics to read").Default("560").Int()
+		benchSamplesFile     = benchWriteCmd.Arg("file", "input file with samples data, default is (../../testdata/20k.series.json)").Default("../../testdata/560series.json").String()
 		listCmd              = cli.Command("ls", "list db blocks")
 		listCmdHumanReadable = listCmd.Flag("human-readable", "print human readable values").Short('h').Bool()
 		listPath             = listCmd.Arg("db path", "database path (default is benchout/storage)").Default("benchout/storage").String()
@@ -64,6 +69,11 @@ func main() {
 			exitWithError(err)
 		}
 		printBlocks(db.Blocks(), listCmdHumanReadable)
+		//printBlocks(db.Blocks())
+		//tsdb.PrintBlocks4(db)
+		
+		tsdb.PrintBlocks3(db)
+		
 	}
 	flag.CommandLine.Set("log.level", "debug")
 }
@@ -103,10 +113,24 @@ func (b *writeBenchmark) run() {
 	l := log.NewLogfmtLogger(log.NewSyncWriter(os.Stderr))
 	l = log.With(l, "ts", log.DefaultTimestampUTC, "caller", log.DefaultCaller)
 
-	st, err := tsdb.Open(dir, l, nil, &tsdb.Options{
+	collectorMetricsRegistry := prometheus.NewRegistry()
+	//Register metrics related to scrape, and the current go process.
+	collectorMetricsRegistry.Register(prometheus.NewProcessCollector(os.Getpid(), ""))
+	collectorMetricsRegistry.Register(prometheus.NewGoCollector())
+	// Register the metrics from the various collectors.
+	go metricsServer(collectorMetricsRegistry, 9080)
+
+	timeInMins := 120 * time.Minute
+	fmt.Println(tsdb.ExponentialBlockRanges(int64(timeInMins)/1e6, 10, 5))
+	fmt.Println(int64(timeDelta*shardScrapeCount))
+	fmt.Println(int64(timeInMins) / 1e6)
+	fmt.Println(int64(timeInMins / 1e6) / 2 * 3)
+	//exitWithError(errors.New("test"))
+
+	st, err := tsdb.Open(dir, l, collectorMetricsRegistry, &tsdb.Options{
 		WALFlushInterval:  200 * time.Millisecond,
-		RetentionDuration: 15 * 24 * 60 * 60 * 1000, // 15 days in milliseconds
-		BlockRanges:       tsdb.ExponentialBlockRanges(2*60*60*1000, 5, 3),
+		RetentionDuration: 15 * 24 * 60 * 60 * 1000,                                      // 15 days in milliseconds
+		BlockRanges:       tsdb.ExponentialBlockRanges(int64(timeInMins/1e6), 10, 5), //tsdb.ExponentialBlockRanges(2*60*60*1000, 5, 3),
 	})
 	if err != nil {
 		exitWithError(err)
@@ -127,12 +151,13 @@ func (b *writeBenchmark) run() {
 			exitWithError(err)
 		}
 	})
+	fmt.Println(" > total metrics:", len(metrics))
 
 	var total uint64
 
 	dur := measureTime("ingestScrapes", func() {
 		b.startProfiling()
-		total, err = b.ingestScrapes(metrics, 3000)
+		total, err = b.ingestScrapes(metrics)
 		if err != nil {
 			exitWithError(err)
 		}
@@ -149,26 +174,49 @@ func (b *writeBenchmark) run() {
 	})
 }
 
-const timeDelta = 30000
+const (
+	// scrapeCount = 10000
+	// shards      = scrapeCount / batchSize
 
-func (b *writeBenchmark) ingestScrapes(lbls []labels.Labels, scrapeCount int) (uint64, error) {
+	// If we change batch size, then need to adjust BlockRanges
+	// size is inverse to block range
+	// blockRange[0] need to be atleast 2 * timeDelta*shardScrapeCount
+	batchSize = 560
+
+	shards        = 100
+	//basets        = 3000
+	//shardInterval = 2000
+
+	timeDelta        = 300
+	shardScrapeCount = 500
+
+	metricsPath = "/metrics"
+	healthzPath = "/healthz"
+)
+
+func (b *writeBenchmark) ingestScrapes(lbls []labels.Labels) (uint64, error) {
 	var mu sync.Mutex
 	var total uint64
 
-	for i := 0; i < scrapeCount; i += 100 {
-		var wg sync.WaitGroup
+	numBatches := b.numMetrics/batchSize
+	fmt.Println(" > batch size:", batchSize, "numBatches", numBatches,  ", shards:", shards)
+
+	for shard := 0; shard < shards; shard++ {
+
+		var batchGroup sync.WaitGroup
 		lbls := lbls
+		batchIndex := 0
 		for len(lbls) > 0 {
-			l := 1000
-			if len(lbls) < 1000 {
+			l := batchSize
+			if len(lbls) < batchSize {
 				l = len(lbls)
 			}
-			batch := lbls[:l]
+			batchData := lbls[:l]
 			lbls = lbls[l:]
 
-			wg.Add(1)
-			go func() {
-				n, err := b.ingestScrapesShard(batch, 100, int64(timeDelta*i))
+			batchGroup.Add(1)
+			go func(batch int) {
+				n, err := b.ingestScrapesShard(shard, batch, numBatches, batchData, shardScrapeCount)
 				if err != nil {
 					// exitWithError(err)
 					fmt.Println(" err", err)
@@ -176,18 +224,22 @@ func (b *writeBenchmark) ingestScrapes(lbls []labels.Labels, scrapeCount int) (u
 				mu.Lock()
 				total += n
 				mu.Unlock()
-				wg.Done()
-			}()
+				batchGroup.Done()
+			}(batchIndex)
+			batchIndex++
+			batchGroup.Wait()
 		}
-		wg.Wait()
 	}
 	fmt.Println("ingestion completed")
+	time.Sleep(10*time.Minute)
 
 	return total, nil
 }
 
-func (b *writeBenchmark) ingestScrapesShard(metrics []labels.Labels, scrapeCount int, baset int64) (uint64, error) {
-	ts := baset
+func (b *writeBenchmark) ingestScrapesShard(shard int, batch int, numBatches int, metrics []labels.Labels, scrapeCount int) (uint64, error) {
+	ts := int64((numBatches*shard + batch) * timeDelta*scrapeCount)
+	baset := ts
+	fmt.Println(" > scrape range", "shard:", shard, "batch:", batch, "base:", baset, ", max:", baset+int64(timeDelta*scrapeCount))
 
 	type sample struct {
 		labels labels.Labels
@@ -196,21 +248,31 @@ func (b *writeBenchmark) ingestScrapesShard(metrics []labels.Labels, scrapeCount
 	}
 
 	scrape := make([]*sample, 0, len(metrics))
+	lset := labels.FromStrings("__name__","sfn_statefulset_status_replicas","dc","PHX","namespace","legostore","statefulset","ceph-osd-0-7")
+	sort.Sort(lset)
 
 	for _, m := range metrics {
 		scrape = append(scrape, &sample{
 			labels: m,
-			value:  123456789,
+			value:  1,
 		})
 	}
 	total := uint64(0)
+
+	refCount := 0
+	fastRefCount := 0
+	count := 0
+
 
 	for i := 0; i < scrapeCount; i++ {
 		app := b.storage.Appender()
 		ts += timeDelta
 
 		for _, s := range scrape {
-			s.value += 1000
+			//s.value += 1000
+			if labels.Compare(s.labels, lset) == 0 {
+				count++
+			}
 
 			if s.ref == nil {
 				ref, err := app.Add(s.labels, ts, float64(s.value))
@@ -218,9 +280,13 @@ func (b *writeBenchmark) ingestScrapesShard(metrics []labels.Labels, scrapeCount
 					panic(err)
 				}
 				s.ref = &ref
+				refCount++
 			} else if err := app.AddFast(*s.ref, ts, float64(s.value)); err != nil {
 
 				if errors.Cause(err) != tsdb.ErrNotFound {
+					fmt.Println(" > scrape range error ", "shard:", shard, "batch:", batch, "base:", ts)
+					fmt.Println(b.storage.Head().MinTime())
+					fmt.Println(b.storage.Head().MaxTime())
 					panic(err)
 				}
 
@@ -229,6 +295,9 @@ func (b *writeBenchmark) ingestScrapesShard(metrics []labels.Labels, scrapeCount
 					panic(err)
 				}
 				s.ref = &ref
+				if ref != 0 {
+					fastRefCount++
+				}
 			}
 
 			total++
@@ -237,6 +306,8 @@ func (b *writeBenchmark) ingestScrapesShard(metrics []labels.Labels, scrapeCount
 			return total, err
 		}
 	}
+	fmt.Println(" > total refs :", refCount, ", fast:", fastRefCount, "count:", count)
+
 	return total, nil
 }
 
@@ -248,7 +319,7 @@ func (b *writeBenchmark) startProfiling() {
 	if err != nil {
 		exitWithError(fmt.Errorf("bench: could not create cpu profile: %v", err))
 	}
-	pprof.StartCPUProfile(b.cpuprof)
+	rprof.StartCPUProfile(b.cpuprof)
 
 	// Start memory profiling.
 	b.memprof, err = os.Create(filepath.Join(b.outPath, "mem.prof"))
@@ -273,23 +344,23 @@ func (b *writeBenchmark) startProfiling() {
 
 func (b *writeBenchmark) stopProfiling() {
 	if b.cpuprof != nil {
-		pprof.StopCPUProfile()
+		rprof.StopCPUProfile()
 		b.cpuprof.Close()
 		b.cpuprof = nil
 	}
 	if b.memprof != nil {
-		pprof.Lookup("heap").WriteTo(b.memprof, 0)
+		rprof.Lookup("heap").WriteTo(b.memprof, 0)
 		b.memprof.Close()
 		b.memprof = nil
 	}
 	if b.blockprof != nil {
-		pprof.Lookup("block").WriteTo(b.blockprof, 0)
+		rprof.Lookup("block").WriteTo(b.blockprof, 0)
 		b.blockprof.Close()
 		b.blockprof = nil
 		runtime.SetBlockProfileRate(0)
 	}
 	if b.mtxprof != nil {
-		pprof.Lookup("mutex").WriteTo(b.mtxprof, 0)
+		rprof.Lookup("mutex").WriteTo(b.mtxprof, 0)
 		b.mtxprof.Close()
 		b.mtxprof = nil
 		runtime.SetMutexProfileFraction(0)
@@ -341,6 +412,7 @@ func readPrometheusLabels(r io.Reader, n int) ([]labels.Labels, error) {
 	return mets, nil
 }
 
+
 func exitWithError(err error) {
 	fmt.Fprintln(os.Stderr, err)
 	os.Exit(1)
@@ -371,4 +443,51 @@ func getFormatedTime(timestamp int64, humanReadable *bool) string {
 		return time.Unix(timestamp/1000, 0).String()
 	}
 	return strconv.FormatInt(timestamp, 10)
+}
+
+func metricsServer(registry prometheus.Gatherer, port int) {
+	// Address to listen on for web interface and telemetry
+	listenAddress := net.JoinHostPort("", strconv.Itoa(port))
+
+	mux := http.NewServeMux()
+
+	mux.Handle("/debug/pprof/", http.HandlerFunc(pprof.Index))
+	mux.Handle("/debug/pprof/cmdline", http.HandlerFunc(pprof.Cmdline))
+	mux.Handle("/debug/pprof/profile", http.HandlerFunc(pprof.Profile))
+	mux.Handle("/debug/pprof/symbol", http.HandlerFunc(pprof.Symbol))
+	mux.Handle("/debug/pprof/trace", http.HandlerFunc(pprof.Trace))
+
+	// Add metricsPath
+	mux.Handle(metricsPath, promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
+	// Add healthzPath
+	mux.HandleFunc(healthzPath, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		w.Write([]byte("ok"))
+	})
+	// Add index
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`<html>
+             <head><title>StorageFoundation State Metrics Server</title></head>
+             <body>
+             <h1>StorageFoundation State Metrics</h1>
+			 <ul>
+             <li><a href='` + metricsPath + `'>metrics</a></li>
+             <li><a href='` + healthzPath + `'>healthz</a></li>
+			 </ul>
+             </body>
+             </html>`))
+	})
+
+	fmt.Println(
+		"SFnStateMetricsMain",
+		"msg:", "Starting metrics server",
+		"address:", listenAddress,
+	)
+
+	fmt.Println(
+		"SFnStateMetricsMain",
+		"msg:", "Failed to start metrics server",
+		"err:", http.ListenAndServe(listenAddress, mux),
+	)
+
 }
